@@ -1,0 +1,9 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+data/trading.db
+logs/
+__pycache__/
+*.pyc
+data/
