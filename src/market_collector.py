@@ -1,29 +1,19 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-import requests
+import yfinance as yf
 
 from src.database.db import init_db, save_candles
 from src.logger import logger
 
-TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
-REQUEST_TIMEOUT = 10
-
 INSTRUMENTS = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "XAUUSD": "XAU/USD",
+    "NIFTY50": "^NSEI",
 }
 
 
 def is_valid_candle(open_, high, low, close):
-    """
-    NEW: rejects candles with physically impossible OHLC relationships.
-    A real candle must satisfy: high is the highest value, low is the lowest.
-    """
     if high < open_ or high < close or high < low:
         return False
     if low > open_ or low > close:
@@ -31,68 +21,47 @@ def is_valid_candle(open_, high, low, close):
     return True
 
 
-def fetch_candles(instrument_code, twelvedata_symbol, api_key):
+def fetch_candles(instrument_code, yf_ticker):
     try:
-        response = requests.get(
-            TWELVEDATA_URL,
-            params={
-                "symbol": twelvedata_symbol,
-                "interval": "1h",
-                "outputsize": 24,
-                "apikey": api_key,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        if response.status_code == 429:
-            logger.error(f"Rate limit (429) hit for TwelveData [{instrument_code}] — skipping")
-            return []
-
-        response.raise_for_status()
-    except requests.exceptions.Timeout:
-        logger.error(f"TwelveData request timed out for {instrument_code}")
-        return []
-    except requests.exceptions.RequestException as e:
-        logger.error(f"TwelveData request failed for {instrument_code}: {e}")
+        data = yf.download(yf_ticker, period="5d", interval="1h", auto_adjust=True, progress=False)
+    except Exception as e:
+        logger.error(f"yfinance request failed for {instrument_code}: {e}")
         return []
 
-    data = response.json()
-
-    if data.get("status") != "ok":
-        logger.warning(f"TwelveData returned non-ok status for {instrument_code}: {data}")
+    if data.empty:
+        logger.warning(f"yfinance returned no data for {instrument_code}")
         return []
 
     collected_at = datetime.now(timezone.utc).isoformat()
     candles = []
     rejected_count = 0
 
-    for entry in data.get("values", []):
+    for timestamp, row in data.iterrows():
         try:
-            open_ = float(entry["open"])
-            high = float(entry["high"])
-            low = float(entry["low"])
-            close = float(entry["close"])
-        except (KeyError, ValueError) as e:
+            open_ = round(float(row[("Open", yf_ticker)]), 2)
+            high = round(float(row[("High", yf_ticker)]), 2)
+            low = round(float(row[("Low", yf_ticker)]), 2)
+            close = round(float(row[("Close", yf_ticker)]), 2)
+            volume = float(row[("Volume", yf_ticker)])
+        except (KeyError, ValueError, TypeError) as e:
             logger.warning(f"Skipping malformed candle for {instrument_code}: {e}")
             rejected_count += 1
             continue
 
         if not is_valid_candle(open_, high, low, close):
-            logger.warning(
-                f"Skipping impossible candle for {instrument_code} at {entry.get('datetime')}: "
-                f"o={open_} h={high} l={low} c={close}"
-            )
+            logger.warning(f"Skipping impossible candle for {instrument_code} at {timestamp}")
             rejected_count += 1
             continue
 
         candles.append({
             "instrument": instrument_code,
-            "timestamp": entry["datetime"],
+            "timestamp": str(timestamp),
             "open": open_,
             "high": high,
             "low": low,
             "close": close,
-            "provider": "twelvedata",
+            "volume": volume,
+            "provider": "yfinance",
             "collected_at": collected_at,
         })
 
@@ -104,15 +73,10 @@ def fetch_candles(instrument_code, twelvedata_symbol, api_key):
 
 def main():
     init_db()
-    api_key = os.getenv("TWELVEDATA_API_KEY")
-
-    if not api_key:
-        logger.error("TWELVEDATA_API_KEY not set — skipping market data collection")
-        return
 
     all_candles = []
-    for instrument_code, symbol in INSTRUMENTS.items():
-        candles = fetch_candles(instrument_code, symbol, api_key)
+    for instrument_code, yf_ticker in INSTRUMENTS.items():
+        candles = fetch_candles(instrument_code, yf_ticker)
         logger.info(f"{instrument_code}: {len(candles)} valid candles fetched")
         all_candles.extend(candles)
 

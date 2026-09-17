@@ -1,4 +1,3 @@
-import json
 import sqlite3
 from contextlib import contextmanager
 
@@ -21,12 +20,26 @@ def init_db():
             CREATE TABLE IF NOT EXISTS articles (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                description TEXT,
                 source TEXT,
                 url TEXT,
                 provider TEXT,
                 published_at TEXT,
                 collected_at TEXT,
                 raw_json TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS article_instruments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                match_type TEXT,
+                match_strength REAL,
+                sentiment REAL,
+                relevance_score REAL,
+                FOREIGN KEY (article_id) REFERENCES articles(id),
+                UNIQUE(article_id, instrument)
             )
         """)
         conn.execute("""
@@ -38,14 +51,12 @@ def init_db():
                 high REAL,
                 low REAL,
                 close REAL,
+                volume REAL,
                 provider TEXT,
                 collected_at TEXT,
                 UNIQUE(instrument, timestamp)
             )
         """)
-        existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(articles)")]
-        if "description" not in existing_columns:
-            conn.execute("ALTER TABLE articles ADD COLUMN description TEXT")
 
 
 def get_existing_article_ids():
@@ -60,11 +71,11 @@ def save_articles(article_records):
             a = record["article"]
             conn.execute(
                 """
-                INSERT INTO articles (id, title, source, url, provider, published_at, collected_at, raw_json, description)
+                INSERT INTO articles (id, title, description, source, url, provider, published_at, collected_at, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (a["id"], a["title"], a["source"], a["url"], a["provider"],
-                 a["published_at"], a["collected_at"], a["raw_json"], a.get("description")),
+                (a["id"], a["title"], a.get("description"), a["source"], a["url"],
+                 a["provider"], a["published_at"], a["collected_at"], a["raw_json"]),
             )
             for inst in record["instruments"]:
                 conn.execute(
@@ -76,10 +87,6 @@ def save_articles(article_records):
                     (a["id"], inst["instrument"], inst["match_type"],
                      inst["match_strength"], inst["sentiment"], inst["relevance_score"]),
                 )
-def get_existing_candle_keys():
-    with get_connection() as conn:
-        rows = conn.execute("SELECT instrument, timestamp FROM market_candles").fetchall()
-        return {(row[0], row[1]) for row in rows}
 
 
 def save_candles(candles):
@@ -87,12 +94,12 @@ def save_candles(candles):
         conn.executemany(
             """
             INSERT OR IGNORE INTO market_candles
-                (instrument, timestamp, open, high, low, close, provider, collected_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (instrument, timestamp, open, high, low, close, volume, provider, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (c["instrument"], c["timestamp"], c["open"], c["high"],
-                 c["low"], c["close"], c["provider"], c["collected_at"])
+                 c["low"], c["close"], c.get("volume"), c["provider"], c["collected_at"])
                 for c in candles
             ],
         )
