@@ -10,24 +10,12 @@ import requests
 from src.config import NEWS_API_KEY
 from src.database.db import init_db, get_existing_article_ids, save_articles
 from src.logger import logger
+from src.matching import compute_relevance_score, match_instruments_by_keywords
 
 MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
 FINNHUB_URL = "https://finnhub.io/api/v1/news"
 REQUEST_TIMEOUT = 10
 
-TARGET_INSTRUMENTS = {"NIFTY50"}
-
-INSTRUMENT_KEYWORDS = {
-    "NIFTY50": {
-        "nifty 50": 0.9, "nifty50": 0.9, "sensex": 0.8, "nifty": 0.7,
-        "indian markets": 0.7, "indian stocks": 0.7, "bse ": 0.6, "nse ": 0.6,
-        "rbi": 0.6, "reserve bank of india": 0.6, "fii": 0.5, "dii": 0.5,
-        "rupee": 0.5, "indian rupee": 0.6,
-        "federal reserve": 0.4, "fed rate": 0.4, "inflation": 0.3,
-        "oil prices": 0.3, "crude oil": 0.3, "interest rate": 0.3,
-    },
-}
-MIN_MATCH_STRENGTH = 0.35
 GENERIC_TITLE_PATTERNS = ["main events for today", "what to watch", "economic calendar", "week ahead", "day ahead"]
 
 
@@ -39,19 +27,6 @@ def make_article_id(url):
     return hashlib.sha256(url.encode()).hexdigest()[:12]
 
 
-def match_instruments_by_keywords(text):
-    text_lower = text.lower()
-    results = []
-    for instrument, keyword_weights in INSTRUMENT_KEYWORDS.items():
-        matched = {kw: w for kw, w in keyword_weights.items() if kw in text_lower}
-        if not matched:
-            continue
-        strength = max(matched.values())
-        if strength >= MIN_MATCH_STRENGTH:
-            results.append((instrument, strength, list(matched.keys())))
-    return results
-
-
 def validate_published_at(value):
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -60,18 +35,6 @@ def validate_published_at(value):
     if dt > datetime.now(timezone.utc) + timedelta(minutes=5):
         return False
     return True
-
-
-def compute_recency_score(published_at_iso):
-    published_dt = datetime.fromisoformat(published_at_iso.replace("Z", "+00:00"))
-    hours_old = (datetime.now(timezone.utc) - published_dt).total_seconds() / 3600
-    score = 1 - (hours_old / 72)
-    return max(0.0, min(1.0, score))
-
-
-def compute_relevance_score(match_strength, published_at_iso):
-    recency = compute_recency_score(published_at_iso)
-    return round((0.7 * match_strength) + (0.3 * recency), 3)
 
 
 def safe_get(dictionary, key, default=None):
@@ -91,7 +54,7 @@ def fetch_with_retry(url, params, max_attempts=3, base_delay=2):
         try:
             response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if response.status_code == 429:
-                logger.error(f"Rate limit (429) hit for {url} — not retrying")
+                logger.error(f"Rate limit (429) hit for {url} - not retrying")
                 return None
             response.raise_for_status()
             return response
@@ -135,16 +98,14 @@ def clean_marketaux_article(raw_article, run_timestamp, stats):
     if not title or not url or not published_at:
         stats.rejected += 1
         return None
-
     if not validate_published_at(published_at):
         stats.rejected += 1
         return None
-
     if is_generic_roundup(title):
         stats.rejected += 1
         return None
 
-    search_text = title + " " + safe_get(raw_article, "description", "")
+    search_text = title + " " + (safe_get(raw_article, "description") or "")
     matches = match_instruments_by_keywords(search_text)
     if not matches:
         stats.rejected += 1
@@ -152,21 +113,19 @@ def clean_marketaux_article(raw_article, run_timestamp, stats):
 
     stats.relevant += 1
     instrument_matches = []
-    for instrument, strength, matched_keywords in matches:
-        logger.info(f"[MARKETAUX KEYWORD] '{title[:60]}' -> {instrument} via {matched_keywords}")
+    for instrument, strength, matched_keywords, match_type in matches:
+        logger.info(f"[MARKETAUX {match_type}] '{title[:60]}' -> {instrument} via {matched_keywords}")
         instrument_matches.append({
             "instrument": instrument,
-            "match_type": "keyword",
+            "match_type": match_type,
             "match_strength": strength,
             "sentiment": None,
             "relevance_score": compute_relevance_score(strength, published_at),
         })
 
-    article_id = make_article_id(url)
-
     return {
         "article": {
-            "id": article_id,
+            "id": make_article_id(url),
             "title": title,
             "source": safe_get(raw_article, "source"),
             "url": url,
@@ -194,8 +153,7 @@ def fetch_marketaux_articles(run_timestamp, stats):
     if response is None:
         return []
 
-    data = response.json()
-    raw_articles = data.get("data", [])
+    raw_articles = response.json().get("data", [])
     stats.fetched = len(raw_articles)
 
     cleaned = [clean_marketaux_article(a, run_timestamp, stats) for a in raw_articles]
@@ -212,7 +170,6 @@ def clean_finnhub_article(raw_article, run_timestamp, cutoff_timestamp, stats):
     if not headline or not url or unix_time is None:
         stats.rejected += 1
         return None
-
     if unix_time < cutoff_timestamp:
         stats.rejected += 1
         return None
@@ -222,12 +179,11 @@ def clean_finnhub_article(raw_article, run_timestamp, cutoff_timestamp, stats):
     if not validate_published_at(published_at):
         stats.rejected += 1
         return None
-
     if is_generic_roundup(headline):
         stats.rejected += 1
         return None
 
-    search_text = headline + " " + safe_get(raw_article, "summary", "")
+    search_text = headline + " " + (safe_get(raw_article, "summary") or "")
     matches = match_instruments_by_keywords(search_text)
     if not matches:
         stats.rejected += 1
@@ -235,21 +191,19 @@ def clean_finnhub_article(raw_article, run_timestamp, cutoff_timestamp, stats):
 
     stats.relevant += 1
     instrument_matches = []
-    for instrument, strength, matched_keywords in matches:
-        logger.info(f"[FINNHUB KEYWORD] '{headline[:60]}' -> {instrument} via {matched_keywords}")
+    for instrument, strength, matched_keywords, match_type in matches:
+        logger.info(f"[FINNHUB {match_type}] '{headline[:60]}' -> {instrument} via {matched_keywords}")
         instrument_matches.append({
             "instrument": instrument,
-            "match_type": "keyword",
+            "match_type": match_type,
             "match_strength": strength,
             "sentiment": None,
             "relevance_score": compute_relevance_score(strength, published_at),
         })
 
-    article_id = make_article_id(url)
-
     return {
         "article": {
-            "id": article_id,
+            "id": make_article_id(url),
             "title": headline,
             "source": safe_get(raw_article, "source"),
             "url": url,
@@ -272,12 +226,12 @@ def fetch_finnhub_articles(run_timestamp, stats):
     cutoff_timestamp = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
 
     response = fetch_with_retry(FINNHUB_URL, {"category": "general", "token": finnhub_key})
-    all_raw_articles = response.json() if response else []
+    all_raw_articles = response.json() if response is not None else []
     stats.fetched = len(all_raw_articles)
 
-    
     cleaned = [clean_finnhub_article(a, run_timestamp, cutoff_timestamp, stats) for a in all_raw_articles]
     return [c for c in cleaned if c is not None]
+
 
 # ---------- MAIN ----------
 
