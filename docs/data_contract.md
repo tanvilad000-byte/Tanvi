@@ -41,7 +41,7 @@ One row per unique news article (deduplicated by URL hash).
 | `instrument` | TEXT | Always `NIFTY50`. |
 | `timestamp` | TEXT | Hourly candle time, IST (`+05:30`), as provided by Yahoo Finance via `yfinance`. |
 | `open`, `high`, `low`, `close` | REAL | Rounded to 2 decimal places. Validated for physical consistency. |
-| `volume` | REAL | The NIFTY50 index feed currently returns `0.0`; it is stored for schema consistency but should not be treated as a meaningful trading-volume feature. |
+| `volume` | REAL | **Always 0 for NIFTY50.** Yahoo Finance reports no volume for the index itself. Do not use this column for analysis. |
 | `provider` | TEXT | `"yfinance"`. |
 
 ## AI handoff file
